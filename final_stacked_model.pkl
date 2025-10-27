@@ -1,0 +1,2 @@
+import joblib
+joblib.dump(stacked_model, "final_stacked_model.pkl")
