@@ -1,107 +1,134 @@
+# app.py
 import streamlit as st
 import joblib
 import numpy as np
-import tempfile
-import os
+import tempfile, os
+from pathlib import Path
+
+# metrics libs
 from radon.complexity import cc_visit
 from radon.metrics import h_visit
 import lizard
 
-# ----------------------------
-# Load trained stacked model
-# ----------------------------
+MODEL_FILENAME = "final_stacked_model.pkl"
+
 @st.cache_resource
 def load_model():
-    return joblib.load("final_stacked_model.pkl")
+    if not os.path.exists(MODEL_FILENAME):
+        raise FileNotFoundError(f"{MODEL_FILENAME} not found. Put it in repo root.")
+    return joblib.load(MODEL_FILENAME)
 
 model = load_model()
 
-# ----------------------------
-# Streamlit App UI
-# ----------------------------
-st.set_page_config(page_title="Software Defect Prediction", page_icon="🧠", layout="wide")
+def extract_basic(code_text):
+    lines = code_text.splitlines()
+    loc = len(lines)
+    blank = sum(1 for l in lines if not l.strip())
+    comments = sum(1 for l in lines if l.strip().startswith("#") or l.strip().startswith("//"))
+    return {"loc": loc, "blank": blank, "comments": comments}
 
-st.title("🧠 Software Defect Prediction System")
-st.markdown("Upload a **Python/Java** source file to predict whether it contains software defects.")
+def extract_radon(code_text):
+    try:
+        cc = cc_visit(code_text)
+        cyclomatic = float(np.mean([c.complexity for c in cc])) if cc else 0.0
+    except Exception:
+        cyclomatic = 0.0
+    try:
+        hal = list(h_visit(code_text))
+        hal_totals = [h.total for h in hal] if hal else []
+        hal_total = float(np.mean(hal_totals)) if hal_totals else 0.0
+        uniq_ops = float(np.mean([h.distinct_operators for h in hal])) if hal else 0.0
+        uniq_opnds = float(np.mean([h.distinct_operands for h in hal])) if hal else 0.0
+    except Exception:
+        hal_total = uniq_ops = uniq_opnds = 0.0
+    return {"cyclomatic": cyclomatic, "hal_total": hal_total, "uniq_ops": uniq_ops, "uniq_opnds": uniq_opnds}
 
-uploaded_file = st.file_uploader("📂 Upload your code file", type=["py", "java"])
+def extract_lizard(path):
+    try:
+        res = lizard.analyze_file(path)
+        n_funcs = len(res.function_list)
+        func_nloc = sum(f.nloc for f in res.function_list)
+    except Exception:
+        n_funcs = 0
+        func_nloc = 0
+    return {"n_funcs": n_funcs, "func_nloc": func_nloc}
 
-if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as tmp:
-        tmp.write(uploaded_file.read())
-        code_path = tmp.name
+def build_feature_vector(m):
+    # EDIT this order to match the exact columns your model expects.
+    # This is a best-effort mapping of common NASA-like features.
+    fv = [
+        m.get("loc",0),
+        m.get("cyclomatic",0),
+        m.get("hal_total",0),
+        m.get("uniq_ops",0),
+        m.get("n_funcs",0),
+        m.get("hal_total",0),   # v
+        m.get("func_nloc",0),   # l
+        m.get("uniq_opnds",0),  # d
+        m.get("uniq_ops",0),    # i
+        m.get("hal_total",0),   # e
+        0.0, 0.0, 0.0,
+        m.get("comments",0),
+        m.get("blank",0),
+        0.0, m.get("uniq_ops",0), m.get("uniq_opnds",0),
+        m.get("hal_total",0), m.get("uniq_opnds",0),
+        m.get("func_nloc",0), 0.0, 0.0, 0.0, 0.0, 0.0,
+        (m.get("comments",0)/(m.get("loc",1) or 1)),
+        (m.get("blank",0)/(m.get("loc",1) or 1))
+    ]
+    return np.array(fv, dtype=float).reshape(1, -1)
+
+st.set_page_config(page_title="Software Defect Predictor", layout="centered")
+st.title("🧠 Software Defect Predictor — Upload code file")
+
+st.write("Upload a Python (.py) or Java (.java) file. The app extracts metrics and predicts buggy / non-buggy.")
+
+uploaded = st.file_uploader("Upload .py or .java file", type=["py","java"])
+if uploaded:
+    ext = Path(uploaded.name).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp.write(uploaded.read())
+        tmp_path = tmp.name
 
     try:
-        with open(code_path, 'r') as f:
-            code = f.read()
+        code = open(tmp_path, "r", encoding="utf-8", errors="ignore").read()
+        basic = extract_basic(code)
+        rad = extract_radon(code)
+        lz = extract_lizard(tmp_path)
 
-        # ----------------------------
-        # 🧩 Feature Extraction
-        # ----------------------------
-        loc = len(code.splitlines())
-        blank = sum(1 for line in code.splitlines() if not line.strip())
-        comments = sum(1 for line in code.splitlines() if line.strip().startswith("#") or line.strip().startswith("//"))
+        metrics = {}
+        metrics.update(basic)
+        metrics.update(rad)
+        metrics.update(lz)
+        metrics["comments"] = basic.get("comments",0)
+        metrics["blank"] = basic.get("blank",0)
 
-        # Cyclomatic complexity (v(g))
-        cc_results = cc_visit(code)
-        v_g = np.mean([r.complexity for r in cc_results]) if cc_results else 1.0
+        st.subheader("Extracted metrics (sample)")
+        st.write({
+            "LOC": metrics["loc"],
+            "Cyclomatic (avg)": round(metrics.get("cyclomatic",0),2),
+            "Functions": metrics.get("n_funcs",0),
+            "Comments": metrics.get("comments",0),
+            "Blank lines": metrics.get("blank",0)
+        })
 
-        # Halstead metrics
-        h_metrics = h_visit(code)
-        if h_metrics:
-            total_ops = np.mean([h.total for h in h_metrics])
-            uniq_ops = np.mean([h.distinct_operators for h in h_metrics])
-            uniq_opnd = np.mean([h.distinct_operands for h in h_metrics])
+        fv = build_feature_vector(metrics)
+        pred = model.predict(fv)[0]
+        proba = model.predict_proba(fv)[0][1] if hasattr(model,"predict_proba") else None
+
+        if pred == 1:
+            st.error("⚠️ Predicted: DEFECTIVE")
         else:
-            total_ops = uniq_ops = uniq_opnd = 1.0
+            st.success("✅ Predicted: NOT DEFECTIVE")
 
-        # Lizard metrics (branch count, functions)
-        lizard_result = lizard.analyze_file(code_path)
-        branch_count = sum(f.nloc for f in lizard_result.function_list)
-        n_funcs = len(lizard_result.function_list)
-
-        # Derived ratios
-        comment_density = comments / loc if loc else 0
-        blank_ratio = blank / loc if loc else 0
-        branch_density = branch_count / loc if loc else 0
-
-        # ----------------------------
-        # 🧠 Create feature vector
-        # ----------------------------
-        # NOTE: fill in approximate defaults for missing NASA-style features
-        features = np.array([[loc, v_g, 1.0, 1.0, n_funcs, total_ops, 1.0, 1.0, 1.0, 1.0,
-                              1.0, 1.0, 1.0, comments, blank, 1.0, uniq_ops, uniq_opnd,
-                              total_ops, uniq_opnd, branch_count, 1.0, branch_density,
-                              1.0, 1.0, 1.0, comment_density, blank_ratio]])
-
-        # ----------------------------
-        # 🧾 Display metrics
-        # ----------------------------
-        st.subheader("📊 Extracted Software Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Lines of Code", loc)
-        col2.metric("Comments", comments)
-        col3.metric("Blank Lines", blank)
-        col1.metric("Cyclomatic Complexity", round(v_g, 2))
-        col2.metric("Branch Count", branch_count)
-        col3.metric("Functions", n_funcs)
-
-        # ----------------------------
-        # 🔮 Prediction
-        # ----------------------------
-        prediction = model.predict(features)
-        prob = model.predict_proba(features)[0][1] if hasattr(model, "predict_proba") else None
-
-        if prediction[0] == 1:
-            st.error("⚠️ This code is predicted to be **DEFECTIVE**.")
-        else:
-            st.success("✅ This code is predicted to be **NON-DEFECTIVE**.")
-
-        if prob is not None:
-            st.info(f"Model Confidence: {prob*100:.2f}%")
+        if proba is not None:
+            st.info(f"Model probability (defect): {proba:.2f}")
 
     except Exception as e:
-        st.error(f"⚠️ Error during analysis: {e}")
-
+        st.error("Error: " + str(e))
     finally:
-        os.remove(code_path)
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
+
